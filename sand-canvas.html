@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Beach Shore</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;1,300&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; overflow:hidden; height:100vh; font-family:'Cormorant Garamond',serif; }
+  canvas { display:block; }
+  #ui {
+    position:fixed; top:14px; left:50%; transform:translateX(-50%);
+    z-index:10; display:flex; gap:20px; align-items:center;
+    background:rgba(0,0,0,0.38); backdrop-filter:blur(16px);
+    border:1px solid rgba(255,255,255,0.10); border-radius:40px;
+    padding:6px 22px;
+    color:rgba(255,255,255,0.55); font-size:12px;
+    letter-spacing:0.14em; text-transform:uppercase;
+  }
+  .sep { color:rgba(255,255,255,0.18); }
+  label { display:flex; align-items:center; gap:6px; cursor:pointer; }
+  input[type=range] {
+    -webkit-appearance:none; width:62px; height:2px;
+    background:rgba(255,255,255,0.2); border-radius:2px; outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; width:9px; height:9px; border-radius:50%;
+    background:rgba(255,255,255,0.7); cursor:pointer;
+  }
+  #sndBtn {
+    background:none; border:none; cursor:pointer; font-size:14px;
+    color:rgba(255,255,255,0.55); padding:0; transition:opacity .2s;
+  }
+  #sndBtn:hover { opacity:1; }
+  #hint {
+    position:fixed; bottom:18px; left:50%; transform:translateX(-50%);
+    color:rgba(255,255,255,0.22); font-size:11.5px; letter-spacing:0.2em;
+    text-transform:uppercase; font-style:italic; pointer-events:none;
+    transition:opacity 1.5s;
+  }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label>Brush <input type="range" id="brushSize" min="3" max="36" value="10"></label>
+  <span class="sep">|</span>
+  <label>Tide <input type="range" id="tideSpeed" min="1" max="10" value="4"></label>
+  <span class="sep">|</span>
+  <button id="sndBtn">🔇</button>
+</div>
+<canvas id="c"></canvas>
+<div id="hint">draw on the shore — the sea forgets nothing</div>
+
+<script>
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SETUP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+let W = 0, H = 0;
+let skyBuf      = null;  // Uint8Array H*3
+let grooveLayer = null;  // Float32Array W*H — carved darkness  0..1
+let ridgeLayer  = null;  // Float32Array W*H — raised brightness 0..1
+let wetLayer    = null;  // Float32Array W*H — wetness           0..1
+let clumps      = [];    // sand clump particles along groove edges
+let totalFrames = 0;
+
+// Beach zones (fractions of H, set in buildLayout)
+let HORIZON   = 0;   // y where sky meets sea
+let SHALLOWS  = 0;   // y where deep sea meets shallow surf
+let SHORELINE = 0;   // mean y of the waterline
+let SAND_TOP  = 0;   // y where wet sand begins
+let DRY_TOP   = 0;   // y where dry sand begins (= SAND_TOP + wet band)
+
+function resize() {
+  const nW = Math.max(1, window.innerWidth  || document.documentElement.clientWidth);
+  const nH = Math.max(1, window.innerHeight || document.documentElement.clientHeight);
+  W = canvas.width  = nW;
+  H = canvas.height = nH;
+  grooveLayer = new Float32Array(W * H);
+  ridgeLayer  = new Float32Array(W * H);
+  wetLayer    = new Float32Array(W * H);
+  clumps      = [];
+  buildLayout();
+  buildSkyBuf();
+}
+
+function buildLayout() {
+  HORIZON   = H * 0.38;
+  SHALLOWS  = H * 0.55;
+  SHORELINE = H * 0.62;
+  SAND_TOP  = H * 0.60;
+  DRY_TOP   = H * 0.68;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  NOISE HELPERS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const PERM = new Uint8Array(512);
+(() => {
+  const p = new Uint8Array(256);
+  for (let i=0;i<256;i++) p[i]=i;
+  for (let i=255;i>0;i--) { const j=(Math.random()*(i+1))|0; [p[i],p[j]]=[p[j],p[i]]; }
+  for (let i=0;i<512;i++) PERM[i]=p[i&255];
+})();
+
+function vnoise(x) {
+  const xi=Math.floor(x)&255, xf=x-Math.floor(x);
+  const u=xf*xf*(3-2*xf);
+  return (PERM[xi]/255)*(1-u) + (PERM[xi+1]/255)*u;
+}
+function vnoise2(x,y) {
+  const xi=Math.floor(x)&255, yi=Math.floor(y)&255;
+  const xf=x-Math.floor(x), yf=y-Math.floor(y);
+  const ux=xf*xf*(3-2*xf), uy=yf*yf*(3-2*yf);
+  const a=PERM[xi+PERM[yi]]/255, b=PERM[xi+1+PERM[yi]]/255;
+  const c=PERM[xi+PERM[yi+1]]/255, d=PERM[xi+1+PERM[yi+1]]/255;
+  return lerp(lerp(a,b,ux), lerp(c,d,ux), uy);
+}
+function fbm(x,y,oct) {
+  let v=0,a=0.5,f=1;
+  for(let i=0;i<oct;i++){v+=a*vnoise2(x*f,y*f);a*=0.5;f*=2;}
+  return v;
+}
+
+function lerp(a,b,t){return a+(b-a)*Math.max(0,Math.min(1,t));}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function smoothstep(a,b,t){t=clamp((t-a)/(b-a),0,1);return t*t*(3-2*t);}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PRECOMPUTE BACKGROUND (sky → deep sea → shallows → shore colours)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function buildSkyBuf() {
+  if (!H) return;
+  skyBuf = new Uint8Array(H * 3);
+  for (let y=0; y<H; y++) {
+    let r,g,b;
+    if (y < HORIZON) {
+      // sky: warm golden-hour haze near horizon, pale blue above
+      const t = y / HORIZON;
+      r = lerp(110, 220, t);   // 110→220
+      g = lerp(140, 195, t);
+      b = lerp(190, 175, t);
+    } else if (y < SHALLOWS) {
+      // deep sea: dark teal-blue
+      const t = (y-HORIZON)/(SHALLOWS-HORIZON);
+      r = lerp(30,  55, t);
+      g = lerp(75, 110, t);
+      b = lerp(110, 130, t);
+    } else if (y < SHORELINE) {
+      // shallow water: lighter turquoise
+      const t = (y-SHALLOWS)/(SHORELINE-SHALLOWS);
+      r = lerp(55,  130, t);
+      g = lerp(110, 175, t);
+      b = lerp(130, 160, t);
+    } else if (y < DRY_TOP) {
+      // wet sand zone
+      const t = (y-SHORELINE)/(DRY_TOP-SHORELINE);
+      r = lerp(130, 175, t);
+      g = lerp(120, 155, t);
+      b = lerp(105, 115, t);
+    } else {
+      // dry sand
+      const t = clamp((y-DRY_TOP)/(H-DRY_TOP), 0, 1);
+      r = lerp(200, 215, t);
+      g = lerp(175, 185, t);
+      b = lerp(120, 130, t);
+    }
+    skyBuf[y*3]   = clamp(r|0,0,255);
+    skyBuf[y*3+1] = clamp(g|0,0,255);
+    skyBuf[y*3+2] = clamp(b|0,0,255);
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WAVE SYSTEM
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let waves = [];
+let foamParticles = [];
+let nextWaveIn = 20;
+const lastFoamFrame = {};
+
+// waveY: evaluate y-position of wave crest at screen-x
+function waveY(w, x) {
+  return w.crest
+    + Math.sin(x*w.k1 + w.ph1)*w.a1
+    + Math.sin(x*w.k2 + w.ph2)*w.a2
+    + Math.sin(x*w.k3 + w.ph3)*w.a3
+    + (vnoise(x*0.006 + w.nOff)-0.5)*2 * w.nAmp;
+}
+
+function spawnWave() {
+  const baseA = 7 + Math.random()*16;
+  waves.push({
+    // start just above horizon line
+    crest: HORIZON - 10 - Math.random()*20,
+    vel:   0.5 + Math.random()*0.6,
+    k1: 0.008+Math.random()*0.005, ph1:Math.random()*Math.PI*2, a1:baseA,
+    k2: 0.020+Math.random()*0.010, ph2:Math.random()*Math.PI*2, a2:baseA*0.40,
+    k3: 0.048+Math.random()*0.016, ph3:Math.random()*Math.PI*2, a3:baseA*0.16,
+    nOff: Math.random()*200, nAmp: baseA*0.30,
+    dph1:0.006+Math.random()*0.005,
+    dph2:0.012+Math.random()*0.008,
+    dph3:0.020+Math.random()*0.010,
+    alpha: 0,
+    // bore: small secondary wavelet after breaking
+    bore: null, boreDone: false,
+    sndDone: false,
+    id: totalFrames + Math.random()
+  });
+}
+
+function advanceWaves() {
+  const spd = parseFloat(document.getElementById('tideSpeed').value)*0.18 + 0.45;
+  waves.forEach(w => {
+    w.crest  += w.vel * spd;
+    w.ph1    += w.dph1; w.ph2 += w.dph2; w.ph3 += w.dph3;
+    w.nOff   += 0.003;
+    // fade in as it enters view, scale height as it approaches shore (shoaling)
+    const prog = clamp((w.crest - HORIZON) / (SHORELINE - HORIZON), 0, 1);
+    w.alpha = clamp(prog * 1.4, 0, 1);
+    // shoaling: wave grows taller as water shallows
+    w.shoal = 1 + smoothstep(0.3, 0.85, prog) * 0.6;
+
+    // spawn bore
+    if (!w.boreDone && w.crest > SHALLOWS + (SHORELINE-SHALLOWS)*0.5) {
+      w.boreDone = true;
+      if (Math.random() < 0.7) {
+        w.bore = {
+          crest: w.crest - 10 - Math.random()*8,
+          vel: w.vel * 0.45,
+          k1:w.k1, ph1:w.ph1+0.6, a1:w.a1*0.28,
+          k2:w.k2, ph2:w.ph2+1.1, a2:w.a2*0.22,
+          k3:w.k3, ph3:w.ph3,     a3:w.a3*0.15,
+          nOff:w.nOff+80, nAmp:w.nAmp*0.25,
+          dph1:w.dph1*0.7, dph2:w.dph2*0.7, dph3:w.dph3*0.7,
+          alpha:0.6, shoal:1
+        };
+      }
+    }
+    if (w.bore) {
+      w.bore.crest  += w.bore.vel * spd * 0.6;
+      w.bore.ph1    += w.bore.dph1; w.bore.ph2 += w.bore.dph2; w.bore.ph3 += w.bore.dph3;
+      w.bore.nOff   += 0.002;
+      w.bore.alpha   = clamp(w.bore.alpha - 0.006, 0, 1);
+    }
+
+    // sound trigger
+    if (!w.sndDone && w.crest > SHALLOWS) {
+      w.sndDone = true;
+      playWaveSound(w.a1 / 23);
+    }
+  });
+  waves = waves.filter(w => w.crest < H + 60);
+}
+
+// ── foam particles ──────────────────────────────────────────────
+function spawnFoam(w) {
+  const n = Math.floor(W / 10);
+  for (let i=0; i<n; i++) {
+    const x = Math.random()*W;
+    const base = waveY(w, x);
+    foamParticles.push({
+      x, y: base + (Math.random()-0.5)*4,
+      vx: (Math.random()-0.5)*0.4,
+      vy: -0.05 + Math.random()*0.35,
+      r:  0.8 + Math.random()*2.8,
+      life: 0.6+Math.random()*0.4,
+      dec:  0.006+Math.random()*0.010
+    });
+  }
+}
+function maybeSpawnFoam() {
+  waves.forEach(w => {
+    if (w.crest < SHALLOWS || w.crest > H+10) return;
+    if (!lastFoamFrame[w.id] || totalFrames-lastFoamFrame[w.id] > 4) {
+      lastFoamFrame[w.id] = totalFrames;
+      spawnFoam(w);
+    }
+  });
+}
+function advanceFoam() {
+  for (let i=foamParticles.length-1; i>=0; i--) {
+    const p=foamParticles[i];
+    p.x+=p.vx; p.y+=p.vy; p.vy+=0.008;
+    p.life-=p.dec;
+    if (p.life<=0) foamParticles.splice(i,1);
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ERODE + WET SAND
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function erodeAndWet() {
+  // dry out slowly
+  for (let i=0; i<W*H; i++) {
+    if (wetLayer[i]>0)    wetLayer[i]    = Math.max(0, wetLayer[i]-0.0010);
+    if (grooveLayer[i]>0) grooveLayer[i] = Math.max(0, grooveLayer[i]-0.0008);
+    if (ridgeLayer[i]>0)  ridgeLayer[i]  = Math.max(0, ridgeLayer[i]-0.0008);
+  }
+
+  waves.forEach(w => {
+    if (w.crest < SHALLOWS-20 || w.crest > H+40) return;
+    const bw = 28 + w.a1 * w.shoal * 1.0;
+    for (let x=0; x<W; x+=2) {
+      const wy = waveY(w, x);
+      const y0 = Math.max(0, Math.round(wy - bw*0.25));
+      const y1 = Math.min(H-1, Math.round(wy + bw*1.6));
+      for (let y=y0; y<=y1; y++) {
+        const t = clamp((y-wy+bw*0.25)/(bw*1.85), 0, 1);
+        const strength = (1-t*t);
+        const idx = y*W+x;
+        grooveLayer[idx] = Math.max(0, grooveLayer[idx] - strength*0.07);
+        ridgeLayer[idx]  = Math.max(0, ridgeLayer[idx]  - strength*0.07);
+        wetLayer[idx]    = Math.min(1, wetLayer[idx]    + strength*0.20);
+        if (x+1<W) {
+          grooveLayer[idx+1] = Math.max(0, grooveLayer[idx+1] - strength*0.055);
+          ridgeLayer[idx+1]  = Math.max(0, ridgeLayer[idx+1]  - strength*0.055);
+          wetLayer[idx+1]    = Math.min(1, wetLayer[idx+1]    + strength*0.16);
+        }
+      }
+    }
+  });
+  // wave also erodes clumps
+  clumps = clumps.filter(c => {
+    for (const w of waves) {
+      if (Math.abs(c.y - waveY(w,c.x)) < 40) { c.life -= 0.05; }
+    }
+    return c.life > 0;
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  RENDER BACKGROUND (pixel-level)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function renderScene() {
+  if (!W||!H||W<1||H<1) return;
+  const img  = ctx.createImageData(W, H);
+  const data = img.data;
+  const T    = totalFrames * 0.012; // time offset for water shimmer
+
+  for (let y=0; y<H; y++) {
+    const br=skyBuf[y*3], bg=skyBuf[y*3+1], bb=skyBuf[y*3+2];
+    const rowBase = y*W*4;
+
+    for (let x=0; x<W; x++) {
+      let r=br, g=bg, b=bb;
+      const idx = y*W+x;
+
+      // ── deep water: animated shimmer lines ──────────────────
+      if (y >= HORIZON && y < SHALLOWS) {
+        const wt = (y-HORIZON)/(SHALLOWS-HORIZON);
+        // caustic shimmer
+        const sh = Math.sin(x*0.04 + T*2.1 + y*0.07)*0.5+0.5;
+        const sh2= Math.sin(x*0.07 - T*1.6 + y*0.05)*0.5+0.5;
+        const caustic = sh*sh2 * 0.12 * (1-wt*0.5);
+        r = clamp(r + caustic*30, 0, 255);
+        g = clamp(g + caustic*45, 0, 255);
+        b = clamp(b + caustic*55, 0, 255);
+        // deep horizon haze / sun glint
+        const glint = Math.pow(Math.sin(x*0.003+0.5)*0.5+0.5, 8)*0.25*(1-wt);
+        r = clamp(r + glint*80, 0, 255);
+        g = clamp(g + glint*70, 0, 255);
+        b = clamp(b + glint*40, 0, 255);
+      }
+
+      // ── shallow water: semi-transparent, sand visible under ─
+      if (y >= SHALLOWS && y < SHORELINE) {
+        const wt = (y-SHALLOWS)/(SHORELINE-SHALLOWS);
+        // gentle ripple pattern
+        const rip = Math.sin(x*0.05 + T*3.0 + wt*8)*0.5+0.5;
+        const rip2= Math.sin(x*0.10 - T*2.2 + wt*5)*0.5+0.5;
+        const ripple = rip*rip2 * 0.18;
+        r = clamp(r + ripple*20, 0, 255);
+        g = clamp(g + ripple*35, 0, 255);
+        b = clamp(b + ripple*40, 0, 255);
+      }
+
+      // ── sand zone: procedural grain texture ─────────────────
+      if (y >= SAND_TOP) {
+        const dryT = smoothstep(SAND_TOP, DRY_TOP, y);
+        // multi-scale grain
+        const n1 = vnoise2(x*0.8+100, y*0.8)*0.5;
+        const n2 = vnoise2(x*3.0+200, y*3.0)*0.25;
+        const n3 = vnoise2(x*9.0+300, y*9.0)*0.12;
+        const grain = (n1+n2+n3 - 0.43) * 22;
+        // ripple marks in dry sand
+        const ripMark = Math.sin(y*0.35 + x*0.02)*3 * dryT;
+        r = clamp(r + grain + ripMark, 0, 255);
+        g = clamp(g + grain*0.85 + ripMark*0.85, 0, 255);
+        b = clamp(b + grain*0.55 + ripMark*0.4, 0, 255);
+      }
+
+      // ── wet sand overlay ─────────────────────────────────────
+      const wv = wetLayer[idx];
+      if (wv > 0.005) {
+        const sh = Math.sin(x*0.06 + T*4.0)*0.5+0.5;
+        r = clamp(lerp(r, r*0.38 + sh*12, wv*0.92), 0, 255);
+        g = clamp(lerp(g, g*0.45 + sh*15, wv*0.92), 0, 255);
+        b = clamp(lerp(b, b*0.65 + sh*30 + 30, wv*0.92), 0, 255);
+      }
+
+      // ── GROOVE: deep carved shadow ───────────────────────────
+      const gv = grooveLayer[idx];
+      if (gv > 0.005) {
+        // dark trough — like wet sand exposed by finger carving
+        // add subtle noise for rough groove floor texture
+        const gn = (((x*374761393^y*668265263)>>>0)%1000)/1000*0.06-0.03;
+        const depth = clamp(gv+gn, 0, 1);
+        // groove floor: darker, slightly cooler/wetter
+        r = clamp(lerp(r, r*0.52, depth*0.90), 0, 255);
+        g = clamp(lerp(g, g*0.56, depth*0.90), 0, 255);
+        b = clamp(lerp(b, b*0.72, depth*0.90), 0, 255);
+      }
+
+      // ── RIDGE: raised sand on groove edges ───────────────────
+      const rv = ridgeLayer[idx];
+      if (rv > 0.005) {
+        const rn = (((x*2246822519^y*3266489917)>>>0)%1000)/1000*0.08-0.04;
+        const h  = clamp(rv+rn, 0, 1);
+        // raised sand: brighter, warm, dry — like piled-up loose grains
+        r = clamp(lerp(r, 238, h*0.85), 0, 255);
+        g = clamp(lerp(g, 210, h*0.85), 0, 255);
+        b = clamp(lerp(b, 148, h*0.85), 0, 255);
+        // micro shadow on the inner face of the ridge (toward groove)
+        if (grooveLayer[idx] > ridgeLayer[idx]*0.4) {
+          r = clamp(r - h*22, 0, 255);
+          g = clamp(g - h*18, 0, 255);
+          b = clamp(b - h*12, 0, 255);
+        }
+      }
+
+      const pi = rowBase + x*4;
+      data[pi]=r|0; data[pi+1]=g|0; data[pi+2]=b|0; data[pi+3]=255;
+    }
+  }
+
+  ctx.putImageData(img, 0, 0);
+
+  // ── sand clumps along groove edges ───────────────────────
+  clumps.forEach(c => {
+    const a = c.life * 0.88;
+    // irregular lumpy blob using multiple overlapping circles
+    for (let i=0; i<c.blobs.length; i++) {
+      const [bx,by,br] = c.blobs[i];
+      const grad = ctx.createRadialGradient(bx,by,0,bx,by,br);
+      grad.addColorStop(0,   `rgba(238,212,155,${a*0.90})`);
+      grad.addColorStop(0.55,`rgba(225,198,138,${a*0.70})`);
+      grad.addColorStop(1,   `rgba(210,185,118,${a*0.0})`);
+      ctx.beginPath();
+      ctx.arc(bx, by, br, 0, Math.PI*2);
+      ctx.fillStyle = grad;
+      ctx.fill();
+    }
+  });
+
+  // ── sky atmospheric haze (drawn after pixel pass) ─────────
+  drawSkyAndHorizon();
+
+  // ── waves (canvas path layer) ────────────────────────────
+  waves.forEach(w => {
+    drawWave(w, w.alpha * w.shoal);
+    if (w.bore && w.bore.alpha > 0.03) drawWave(w.bore, w.bore.alpha);
+  });
+
+  // ── foam particles ────────────────────────────────────────
+  foamParticles.forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(255,255,255,${p.life*0.75})`;
+    ctx.fill();
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SKY & HORIZON ATMOSPHERE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function drawSkyAndHorizon() {
+  // soft horizon glow
+  const hg = ctx.createLinearGradient(0, HORIZON-60, 0, HORIZON+40);
+  hg.addColorStop(0,   'rgba(255,220,150,0)');
+  hg.addColorStop(0.45,'rgba(255,210,120,0.10)');
+  hg.addColorStop(0.65,'rgba(240,200,100,0.08)');
+  hg.addColorStop(1,   'rgba(200,180,100,0)');
+  ctx.fillStyle = hg;
+  ctx.fillRect(0, HORIZON-60, W, 100);
+
+  // sun disc
+  const sx = W*0.62, sy = HORIZON - 18;
+  const sun = ctx.createRadialGradient(sx,sy,0, sx,sy,55);
+  sun.addColorStop(0,   'rgba(255,245,200,0.55)');
+  sun.addColorStop(0.25,'rgba(255,220,130,0.22)');
+  sun.addColorStop(1,   'rgba(255,200,80,0)');
+  ctx.fillStyle = sun;
+  ctx.fillRect(sx-55, sy-55, 110, 110);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  DRAW SINGLE WAVE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const wBuf = new Float32Array(8000); // x,y pairs
+
+function drawWave(w, alpha) {
+  if (alpha < 0.02 || !W) return;
+  const step = 3;
+  const n    = Math.ceil(W/step)+2;
+
+  for (let i=0; i<n; i++) {
+    const x = i*step;
+    wBuf[i*2]   = x;
+    wBuf[i*2+1] = waveY(w, x) * (w.shoal||1);
+  }
+
+  // ── water body fill ──────────────────────────────────────
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(wBuf[0], wBuf[1]);
+  for (let i=1; i<n; i++) {
+    const x0=wBuf[(i-1)*2],y0=wBuf[(i-1)*2+1];
+    const x1=wBuf[i*2],    y1=wBuf[i*2+1];
+    ctx.quadraticCurveTo(x0,y0,(x0+x1)*0.5,(y0+y1)*0.5);
+  }
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+
+  let minY=H;
+  for (let i=0;i<n;i++) if(wBuf[i*2+1]<minY) minY=wBuf[i*2+1];
+  const grd = ctx.createLinearGradient(0, minY-4, 0, minY+90);
+  grd.addColorStop(0,    `rgba(140,210,240,${alpha*0.30})`);
+  grd.addColorStop(0.12, `rgba(80,170,215,${alpha*0.22})`);
+  grd.addColorStop(0.5,  `rgba(50,130,185,${alpha*0.12})`);
+  grd.addColorStop(1,    `rgba(20, 80,140,${alpha*0.03})`);
+  ctx.fillStyle = grd;
+  ctx.fill();
+  ctx.restore();
+
+  // ── crest line — glowing blue-white ──────────────────────
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(wBuf[0], wBuf[1]);
+  for (let i=1; i<n; i++) {
+    const x0=wBuf[(i-1)*2],y0=wBuf[(i-1)*2+1];
+    const x1=wBuf[i*2],    y1=wBuf[i*2+1];
+    ctx.quadraticCurveTo(x0,y0,(x0+x1)*0.5,(y0+y1)*0.5);
+  }
+  ctx.strokeStyle = `rgba(210,240,255,${alpha*0.80})`;
+  ctx.lineWidth   = 1.6;
+  ctx.shadowColor = `rgba(130,210,255,${alpha*0.6})`;
+  ctx.shadowBlur  = 10;
+  ctx.stroke();
+  ctx.restore();
+
+  // ── white foam crest lip ──────────────────────────────────
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(wBuf[0], wBuf[1]-2.5);
+  for (let i=1; i<n; i++) {
+    const x0=wBuf[(i-1)*2],y0=wBuf[(i-1)*2+1]-2.5;
+    const x1=wBuf[i*2],    y1=wBuf[i*2+1]-2.5;
+    ctx.quadraticCurveTo(x0,y0,(x0+x1)*0.5,(y0+y1)*0.5);
+  }
+  ctx.strokeStyle = `rgba(255,255,255,${alpha*0.52})`;
+  ctx.lineWidth   = 1.1;
+  ctx.stroke();
+  ctx.restore();
+
+  // ── inner translucent curl shadow ────────────────────────
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(wBuf[0], wBuf[1]+5);
+  for (let i=1; i<n; i++) {
+    const x0=wBuf[(i-1)*2],y0=wBuf[(i-1)*2+1]+5;
+    const x1=wBuf[i*2],    y1=wBuf[i*2+1]+5;
+    ctx.quadraticCurveTo(x0,y0,(x0+x1)*0.5,(y0+y1)*0.5);
+  }
+  ctx.strokeStyle = `rgba(20,80,130,${alpha*0.22})`;
+  ctx.lineWidth   = 2.5;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WEB AUDIO — OCEAN SOUND
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let actx=null, mGain=null, soundOn=false;
+const sndBtn = document.getElementById('sndBtn');
+
+function initAudio() {
+  if (actx) return;
+  actx  = new (window.AudioContext||window.webkitAudioContext)();
+  mGain = actx.createGain(); mGain.gain.value=0;
+  mGain.connect(actx.destination);
+  buildOceanAmbient();
+}
+
+function pinkBuf(sec) {
+  const len = Math.round(actx.sampleRate*sec);
+  const buf = actx.createBuffer(1,len,actx.sampleRate);
+  const d   = buf.getChannelData(0);
+  let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
+  for (let i=0;i<len;i++) {
+    const w=Math.random()*2-1;
+    b0=0.99886*b0+w*0.0555179; b1=0.99332*b1+w*0.0750759;
+    b2=0.96900*b2+w*0.1538520; b3=0.86650*b3+w*0.3104856;
+    b4=0.55000*b4+w*0.5329522; b5=-0.7616*b5-w*0.0168980;
+    d[i]=(b0+b1+b2+b3+b4+b5+b6+w*0.5362)*0.10; b6=w*0.115926;
+  }
+  return buf;
+}
+
+function buildOceanAmbient() {
+  const buf = pinkBuf(7);
+  function layer(f,Q,lf,ld,g) {
+    const s=actx.createBufferSource(); s.buffer=buf; s.loop=true;
+    const bp=actx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=f; bp.Q.value=Q;
+    const gn=actx.createGain(); gn.gain.value=g;
+    const lfo=actx.createOscillator(); lfo.type='sine'; lfo.frequency.value=lf;
+    const lg=actx.createGain(); lg.gain.value=ld;
+    lfo.connect(lg); lg.connect(gn.gain); lfo.start();
+    s.connect(bp); bp.connect(gn); gn.connect(mGain); s.start(0);
+  }
+  layer(45,  0.5, 0.055, 0.022, 0.60);  // deep sub rumble
+  layer(100, 0.7, 0.085, 0.038, 0.45);  // low boom
+  layer(350, 1.0, 0.110, 0.050, 0.28);  // mid hiss
+  layer(850, 1.7, 0.160, 0.055, 0.16);  // surf
+  layer(2000,2.8, 0.220, 0.040, 0.09);  // fizz
+}
+
+function playWaveSound(intensity) {
+  if (!soundOn||!actx) return;
+  const t=actx.currentTime, dur=1.5+Math.random()*1.0;
+  const buf=pinkBuf(dur+0.4);
+  const s=actx.createBufferSource(); s.buffer=buf;
+  const bp=actx.createBiquadFilter(); bp.type='bandpass';
+  bp.frequency.setValueAtTime(1000+Math.random()*500,t);
+  bp.frequency.exponentialRampToValueAtTime(260,t+dur*0.7);
+  bp.Q.value=1.4;
+  const hp=actx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=180;
+  const env=actx.createGain();
+  env.gain.setValueAtTime(0,t);
+  env.gain.linearRampToValueAtTime(intensity*0.65,t+0.045);
+  env.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  s.connect(bp); bp.connect(hp); hp.connect(env); env.connect(mGain);
+  s.start(t); s.stop(t+dur+0.2);
+}
+
+sndBtn.addEventListener('click', ()=>{
+  initAudio();
+  if (actx.state==='suspended') actx.resume();
+  soundOn=!soundOn;
+  mGain.gain.setTargetAtTime(soundOn?0.60:0, actx.currentTime, 0.5);
+  sndBtn.textContent = soundOn ? '🔊' : '🔇';
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SAND DRAWING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let drawing=false, lastX=-1, lastY=-1;
+const hint=document.getElementById('hint');
+let hintTimer;
+
+// stamp a single groove+ridge footprint at (cx,cy)
+function stampGroove(cx, cy, size) {
+  cx = Math.round(cx); cy = Math.round(cy);
+  const R  = Math.ceil(size);           // outer ridge radius
+  const GR = Math.ceil(size * 0.45);   // groove core radius (narrower than ridge)
+
+  for (let dy = -R; dy <= R; dy++) {
+    for (let dx = -R; dx <= R; dx++) {
+      const d = Math.sqrt(dx*dx + dy*dy);
+      if (d > R) continue;
+      const px = cx+dx, py = cy+dy;
+      if (px<0||px>=W||py<0||py>=H) continue;
+      const idx = py*W+px;
+
+      if (d <= GR) {
+        // GROOVE CORE: deep carved channel
+        const t = d / GR;
+        // deepest in center, tapers to edges
+        const depth = (1 - t*t) * 0.95;
+        grooveLayer[idx] = Math.min(1, grooveLayer[idx] + depth * 0.30);
+        // slightly wet at bottom of groove
+        wetLayer[idx] = Math.min(0.6, wetLayer[idx] + depth * 0.12);
+        // push ridge outward — zero any ridge in the groove
+        ridgeLayer[idx] = Math.max(0, ridgeLayer[idx] - depth * 0.4);
+      } else {
+        // RIDGE ZONE: piled-up sand on either side of groove
+        const t = (d - GR) / (R - GR); // 0 at groove edge, 1 at outer limit
+        // ridge peaks around t=0.2–0.4 then falls off
+        const ridgePeak = Math.exp(-Math.pow((t-0.28)*3.5, 2));
+        ridgeLayer[idx] = Math.min(1, ridgeLayer[idx] + ridgePeak * 0.45);
+        // also slightly darken very edge (natural shadow)
+        grooveLayer[idx] = Math.max(0, grooveLayer[idx] - 0.05);
+      }
+    }
+  }
+}
+
+// spawn irregular clumps of sand along the groove edge
+function spawnClumps(cx, cy, size) {
+  const n = 2 + Math.floor(Math.random()*3);
+  for (let i=0; i<n; i++) {
+    const angle = Math.random()*Math.PI*2;
+    const dist  = size * (0.5 + Math.random()*0.7);
+    const ex = cx + Math.cos(angle)*dist;
+    const ey = cy + Math.sin(angle)*dist;
+    if (ex<0||ex>=W||ey<0||ey>=H) continue;
+    // each clump = cluster of 2–5 small overlapping circles for an irregular shape
+    const blobCount = 2 + Math.floor(Math.random()*4);
+    const blobs = [];
+    for (let b=0; b<blobCount; b++) {
+      const ba = Math.random()*Math.PI*2;
+      const br_dist = Math.random()*(size*0.18);
+      const br = size * (0.10 + Math.random()*0.18);
+      blobs.push([ex + Math.cos(ba)*br_dist, ey + Math.sin(ba)*br_dist, br]);
+    }
+    clumps.push({ x:ex, y:ey, blobs, life:0.85+Math.random()*0.15 });
+  }
+  // cap total clumps to avoid overflow
+  if (clumps.length > 1800) clumps.splice(0, clumps.length-1800);
+}
+
+function paintSand(x, y) {
+  const size = parseInt(document.getElementById('brushSize').value);
+
+  // stamp groove at current point
+  stampGroove(x, y, size);
+
+  // interpolate between last and current to avoid gaps
+  if (lastX >= 0) {
+    const dist  = Math.hypot(x-lastX, y-lastY);
+    const steps = Math.ceil(dist / (size * 0.35));
+    for (let s=1; s<steps; s++) {
+      const t = s/steps;
+      stampGroove(lastX+(x-lastX)*t, lastY+(y-lastY)*t, size);
+    }
+    // spawn clumps sparsely along stroke
+    if (dist > size * 0.8 && Math.random() < 0.55) {
+      spawnClumps(x, y, size);
+    }
+  }
+}
+
+canvas.addEventListener('mousedown', e=>{
+  drawing=true; lastX=e.clientX; lastY=e.clientY;
+  clearTimeout(hintTimer); hint.style.opacity='0';
+});
+canvas.addEventListener('mousemove', e=>{ if(!drawing) return; paintSand(e.clientX,e.clientY); lastX=e.clientX; lastY=e.clientY; });
+canvas.addEventListener('mouseup',    ()=>{ drawing=false; lastX=-1; lastY=-1; });
+canvas.addEventListener('mouseleave', ()=>{ drawing=false; lastX=-1; lastY=-1; });
+canvas.addEventListener('touchstart', e=>{ e.preventDefault(); drawing=true; const t=e.touches[0]; lastX=t.clientX; lastY=t.clientY; clearTimeout(hintTimer); hint.style.opacity='0'; },{ passive:false });
+canvas.addEventListener('touchmove',  e=>{ e.preventDefault(); if(!drawing) return; const t=e.touches[0]; paintSand(t.clientX,t.clientY); lastX=t.clientX; lastY=t.clientY; },{ passive:false });
+canvas.addEventListener('touchend',   ()=>{ drawing=false; lastX=-1; lastY=-1; });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  MAIN LOOP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function loop() {
+  if (!W||!H||W<1||H<1) { requestAnimationFrame(loop); return; }
+  totalFrames++;
+  const speed = parseFloat(document.getElementById('tideSpeed').value);
+
+  nextWaveIn--;
+  if (nextWaveIn <= 0) {
+    spawnWave();
+    nextWaveIn = Math.round((185-speed*12) + Math.random()*60);
+  }
+
+  advanceWaves();
+  maybeSpawnFoam();
+  advanceFoam();
+  erodeAndWet();
+  renderScene();
+
+  requestAnimationFrame(loop);
+}
+
+resize();
+window.addEventListener('resize', resize);
+hintTimer = setTimeout(()=> hint.style.opacity='0', 6000);
+loop();
+</script>
+</body>
+</html>
